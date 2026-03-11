@@ -1,0 +1,12 @@
+name: SFH_Shipments_Insigths
+title: SFH_Shipments_Insigths
+username: mgisa
+account: mgisa
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16875054
+bundleId: 11695336
+url: https://mgisa.shinyapps.io/SFH_Shipments_Insigths/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE

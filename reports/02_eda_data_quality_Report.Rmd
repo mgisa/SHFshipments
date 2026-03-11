@@ -1,0 +1,661 @@
+---
+title: "USAID SCMS Health Logistics"
+subtitle: "Data Scientist Technical Report"
+author: "Data Scientist Track Submission by Murera Gisa"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: show
+    fig_width: 10
+    fig_height: 5.5
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = 'center')
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+# Create directories for output
+dir.create("reports/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Executive Summary
+
+This report fulfils the **Data Scientist track** of the SFH Rwanda technical challenge.
+It covers EDA, data quality and inconsistency checks, data transformation, hypothesis testins and some visual representations from the data.
+
+This report presents an exploratory data analysis (EDA) of the `USAID SCMS Delivery History Dataset`, focusing on __data quality issues__ and testing a key __business hypothesis__ about shipping mode costs. The analysis identifies three critical data quality issues that must be addressed before any modeling/dashboarding or reporting, and provides statistical evidence for air freight being significantly more expensive than truck transport for heavy loads.
+
+Finaly this reports provides the overall reproducible functions to automatically validate the data since it is vital and important for any data-related project.
+
+> Key Findings:
+
+- Issue 1: $\approx 40\%$ of freight cost values are non-numeric text requiring classification
+
+- Issue 2: Extreme outliers ($>\$500,000$) skew freight cost distributions
+
+- Issue 3: "N/A" string values create a spurious shipment mode category
+
+> Hypothesis:
+
+Air freight is $6.5\times$ more expensive than truck for loads $>500$ kg ($p < 0.001$)
+
+## 1. Data Loading and Initial Inspection
+
+```{r}
+# Load the raw dataset
+raw <- read_csv(here::here("data/raw/SCMS_Delivery_History_Dataset.csv"),
+                locale = locale(encoding = "latin1"),  # handles Côte d'Ivoire accent
+                show_col_types = FALSE) %>% janitor::clean_names()
+
+# Display basic dataset information
+cat(sprintf("  Rows    : %d\n",    nrow(raw)))
+cat(sprintf("  Columns : %d\n",    ncol(raw)))
+cat(sprintf("  Period  : %s  to  %s\n\n",
+            min(raw$scheduled_delivery_date, na.rm = TRUE),
+            max(raw$scheduled_delivery_date, na.rm = TRUE)))
+```
+
+- *Interpretation:* The dataset contains `r nrow(raw)` shipments spanning from 
+`r min(raw$scheduled_delivery_date, na.rm = TRUE)` to
+`r max(raw$scheduled_delivery_date, na.rm = TRUE)`. With `r ncol(raw)` variables, this provides a rich foundation for analyzing supply chain efficiency and costs across different shipping modes and destinations.
+
+## 2.Data Quality Issues 
+
+This section presents the data quality issues and present them in interactive way.
+
+### Issue no. 1: Non numeric Freight Cost Values
+
+*State of the Problem:* The freight_cost_usd column contains approximately $40\%$ non-numeric text values. A naive `as.numeric()` conversion would silently convert these to `NA`, losing valuable information and potentially biasing analyses.
+
+```{r}
+freight_classes <- tibble(val = raw$`freight_cost_usd`) %>%
+  mutate(
+    category = case_when(
+      str_detect(val, "^\\d")                                ~ "Numeric (parseable)",
+      str_detect(val, "Freight Included|Invoiced Separately") ~ "Included in commodity cost",
+      str_detect(val, "^See ")                               ~ "Cross-reference to other row",
+      is.na(val) | val == ""                                 ~ "Blank / missing",
+      TRUE                                                   ~ "Other text"
+    )
+  ) %>%
+  count(category) %>%
+  mutate(pct = round(100 * n / nrow(raw), 1)) %>%
+  arrange(desc(n))
+
+# Display the breakdown
+kable(freight_classes, 
+      col.names = c("Category", "Count", "Percentage"),
+      caption = "Table 1: Freight Cost Value Categories") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+non_numeric_n <- sum(freight_classes$n[freight_classes$category != "Numeric (parseable)"])
+
+#Visualization 
+
+p1 <- ggplot(freight_classes,
+             aes(x = reorder(category, n), y = n, fill = category)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "  (", pct, "%)")),
+            hjust = -0.05, size = 3.6) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Numeric (parseable)"             = "#6DB57A",
+    "Included in commodity cost"      = "#F5A623",
+    "Cross-reference to other row"    = "#E05C5C",
+    "Blank / missing"                 = "#B0B0B0",
+    "Other text"                      = "#888888"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.28))) +
+  labs(
+    title    = "Issue #1: ~40% of Freight Cost Values Are Non-Numeric Text",
+    subtitle = "Naive as.numeric() would silently discard these as NA — three categories need different treatment",
+    x = NULL, y = "Number of records",
+    caption  = "Author: Murera Gisa \n Source: USAID SCMS Delivery History Dataset"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", colour = "#1A3A5C"))
+
+print(p1)
+ggsave("reports/figures/issue1_non_numeric_freight.png", p1, width = 10, height = 4.5, dpi = 150)
+non_numeric_n <- sum(freight_classes$n[freight_classes$category != "Numeric (parseable)"])
+```
+
+*Interpretation:* The above Figure 1 reveals `r non_numeric_n` records
+(`r round(100 * non_numeric_n / nrow(raw), 1)`\%) records
+with non-numeric freight costs. These fall into three distinct categories requiring different treatments:
+
+- **Included in commodity cost**: (`r freight_classes$n[3]` == "Included in commodity cost"] records): The freight cost is bundled with product cost, and  these should be set to $\$0$ for separate freight analysis
+
+- **Cross-reference**: to other row" (`r freight_classes$n[2]` == "Cross-reference to other row"] records): Costs are documented in another shipment record ,this requires joining logic
+
+- **Blank or Missing**: The results shows that  `287` records are missing in `line_item_insurance_usd` column. True missing values requiring imputation or exclusion.
+
+**Business Impact:** Ignoring this issue would result in $40\%$ data loss for any freight cost analysis, potentially biasing results toward shipments that explicitly itemize freight costs.
+
+### Issue No.2 Extreme Outliers in Freight Costs
+
+* State of the Problem:*
+Among numerically parseable freight costs, the distribution shows extreme right skew with values exceeding $\$500,000$, which would inflate average cost calculations.
+
+```{r}
+numeric_freight <- raw %>%
+  mutate(freight_usd = suppressWarnings(as.numeric(freight_cost_usd))) %>%
+  filter(!is.na(freight_usd), freight_usd >= 0)
+
+q1_val      <- quantile(numeric_freight$freight_usd, 0.25)
+q3_val      <- quantile(numeric_freight$freight_usd, 0.75)
+iqr_val     <- q3_val - q1_val
+upper_fence <- q3_val + 1.5 * iqr_val
+outlier_n   <- sum(numeric_freight$freight_usd > upper_fence)
+
+# Create summary statistics table
+outlier_stats <- data.frame(
+  Metric = c("Numeric Records", "Median Cost", "IQR Upper Fence", 
+             "Outliers Above Fence", "Maximum Value"),
+  Value = c(nrow(numeric_freight),
+            paste0("$", format(round(median(numeric_freight$freight_usd)), big.mark = ",")),
+            paste0("$", format(round(upper_fence), big.mark = ",")),
+            paste0(outlier_n, " (", round(100 * outlier_n / nrow(numeric_freight), 1), "%)"),
+            paste0("$", format(round(max(numeric_freight$freight_usd)), big.mark = ",")))
+)
+
+kable(outlier_stats, col.names = c("Metric", "Value"),
+      caption = "Table 2: Freight Cost Outlier Statistics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+p2 <- numeric_freight %>%
+  filter(freight_usd <= quantile(freight_usd, 0.995)) %>%   # truncate for readability
+  ggplot(aes(x = freight_usd)) +
+  geom_histogram(bins = 70, fill = "#4A90D9", colour = "white", linewidth = 0.15) +
+  geom_vline(xintercept = upper_fence, colour = "#E05C5C",
+             linetype = "dashed", linewidth = 1.1) +
+  annotate("text", x = upper_fence * 1.06, y = Inf, vjust = 2, hjust = 0,
+           label = paste0("IQR fence\n$", format(round(upper_fence), big.mark = ",")),
+           colour = "#E05C5C", size = 3.6) +
+  scale_x_continuous(labels = dollar_format(big.mark = ",")) +
+  labs(
+    title    = "Issue #2: Extreme Right Skew — Outliers in Numeric Freight Costs",
+    subtitle = "X-axis truncated at 99.5th percentile; long tail reaches >$500k",
+    x = "freight_cost_usd", y = "Count",
+    caption  = "Author: Murera Gisa \n Source: USAID SCMS Delivery History Dataset"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", colour = "#1A3A5C"))
+
+print(p2)
+ggsave("reports/figures/issue2_freight_outliers.png", p2, width = 10, height = 4.5, dpi = 150)
+```
+
+*Interpretation:* The above Figure 2 shows the distribution of numeric freight costs (truncated at the $99.5^{th}$ percentile for visibility). The IQR method identifies 
+`r outlier_n` outliers (`r round(100 * outlier_n / nrow(numeric_freight), 1)`\% of numeric records) above the upper fence of `r format(round(upper_fence), big.mark = ",")`. The maximum value of `r format(round(max(numeric_freight$freight_usd)), big.mark = ",")` is orders of magnitude higher than the median.
+
+**Business Impact:** Including these outliers in average cost calculations would inflate estimates by $10$ to $100$ times, potentially leading to:
+
+- Overstated budget requirements
+
+- Incorrect mode cost comparisons
+
+- Misleading country-level cost analyses
+
+**Recommended Treatment:** Flag outliers using IQR method and exclude them from average-cost analyses, or use robust statistics (median, trimmed means).
+
+### Issue no 3. String 'N/A' Sentinel in Shipment Mode
+
+_State of the Problem:_
+The literal string `N/A` is used as a sentinel value in the Shipment Mode column. R's `is.na()` returns FALSE for these values, meaning they would be treated as a legitimate fifth shipping mode in analyses.
+
+```{r}
+mode_dist <- raw %>%
+  count(shipment_mode, sort = TRUE) %>%
+  mutate(
+    pct         = round(100 * n / nrow(raw), 1),
+    is_sentinel = shipment_mode == "N/A"
+  )
+
+kable(mode_dist, 
+      col.names = c("Shipment Mode", "Count", "Percentage", "Is Sentinel"),
+      caption = "Table 3: Shipment Mode Distribution") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+p3 <- ggplot(mode_dist,
+             aes(x = reorder(shipment_mode, n), y = n,
+                 fill = is_sentinel)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, "  (", pct, "%)")),
+            hjust = -0.05, size = 3.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "#1A3A5C", "TRUE" = "#E05C5C")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.22))) +
+  labs(
+    title    = "Issue #3: 360 Records Have Shipment Mode = 'N/A' (a String, Not R's NA)",
+    subtitle = "Red bar = sentinel value; is.na() returns FALSE — must be explicitly recoded",
+    x = NULL, y = "Number of records",
+    caption  = "Authr: Murera Gisa, \n Source: USAID SCMS Delivery History Dataset"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", colour = "#1A3A5C"))
+
+print(p3)
+ggsave("reports/figures/issue3_shipment_mode_na.png", p3, width = 10, height = 4, dpi = 150)
+```
+
+*Interpretation:* Figure 3 highlights `r mode_dist$n[mode_dist$shipment_mode== "N/A"]` records (`r mode_dist$pct[mode_dist$shipment_mode== "N/A"]`\%) where Shipment Mode contains the string "N/A" rather than a true NA value. These would be incorrectly treated as a separate shipping mode in any grouping operation.
+
+**Business Impact:** Without recoding, any analysis by shipping mode would:
+
+- Include a spurious "N/A" category
+
+- Misrepresent the distribution of legitimate shipping modes
+
+- Potentially skew mode-specific cost calculations
+
+**Recommended Treatment:** Explicitly recode "N/A" to NA_character_ before any analysis:
+
+```{r}
+raw$Shipment_Mode_clean <- ifelse(raw$shipment_mode == "N/A", NA, raw$shipment_mode)
+
+```
+
+## Hypothesis Test: Air vs Truck Cost-per-KG for Heavy Loads
+
+### Hypothesis Formulation
+
+**Business Question:** For heavy loads which is greater than $500 Kgs$), is air freight significantly more expensive per kilogram than truck transport?
+
+**Statistical Framework:**
+
+- *H₀ (Null):* No significant difference in cost/kg between Air and Truck for load greater than 500 Kgs.
+
+- *H₁ (Alternative):* Air costs is significantly more per kg than Truck for heavy loads
+
+**Test Approach:** To test the above hypotheses we have used *Wilcoxon rank-sum test* which non-parametric test suitable for our skewed cost data.Therefore we have considered the *significance level* of $\alpha = 0.05$ and confidence level of $95\%$
+
+### Data Preparation
+
+```{r}
+hyp_df <- raw %>%
+  mutate(
+    freight_usd = suppressWarnings(as.numeric(freight_cost_usd)),
+    weight_kg   = suppressWarnings(as.numeric(weight_kilograms)),
+    mode_clean  = case_when(
+      shipment_mode == "Air"         ~ "Air",
+      shipment_mode == "Air Charter" ~ "Air Charter",
+      shipment_mode == "Truck"       ~ "Truck",
+      shipment_mode == "Ocean"       ~ "Ocean",
+      TRUE                             ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(freight_usd), freight_usd > 0,
+    !is.na(weight_kg),   weight_kg > 500,   # heavy loads only
+    mode_clean %in% c("Air", "Truck", "Ocean")
+  ) %>%
+  mutate(cost_per_kg = freight_usd / weight_kg) %>%
+  filter(cost_per_kg < quantile(cost_per_kg, 0.99, na.rm = TRUE))  # trim top 1% for visualization
+
+# Descriptive statistics
+hyp_summary <- hyp_df %>%
+  group_by(Mode = mode_clean) %>%
+  summarise(
+    n           = n(),
+    median_cpk  = round(median(cost_per_kg), 2),
+    mean_cpk    = round(mean(cost_per_kg), 2),
+    sd_cpk      = round(sd(cost_per_kg), 2),
+    .groups     = "drop"
+  )
+
+kable(hyp_summary, 
+      col.names = c("Mode", "N", "Median ($/kg)", "Mean ($/kg)", "SD ($/kg)"),
+      caption = "Table 4: Cost per KG Statistics by Mode (Loads >500 kg)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+
+### Statistical Analysis
+
+```{r}
+# Wilcoxon rank-sum test: one-sided Air > Truck
+air_cpk   <- hyp_df$cost_per_kg[hyp_df$mode_clean == "Air"]
+truck_cpk <- hyp_df$cost_per_kg[hyp_df$mode_clean == "Truck"]
+wt        <- wilcox.test(air_cpk, truck_cpk, alternative = "greater")
+
+# Effect size r = Z / sqrt(N)
+z_stat    <- qnorm(wt$p.value / 2, lower.tail = FALSE)
+effect_r  <- round(z_stat / sqrt(length(air_cpk) + length(truck_cpk)), 3)
+multiplier <- round(median(air_cpk) / median(truck_cpk), 1)
+
+# Create results table
+test_results <- data.frame(
+  Metric = c("Sample Size (Air)", "Sample Size (Truck)", 
+             "Median Air ($/kg)", "Median Truck ($/kg)",
+             "Cost Multiplier", "P-value", "Effect Size (r)", 
+             "Effect Magnitude", "Decision (α=0.05)"),
+  Value = c(length(air_cpk), length(truck_cpk),
+            paste0("$", median(air_cpk)), paste0("$", median(truck_cpk)),
+            paste0(multiplier, "×"),
+            if (wt$p.value < 0.001) "< 0.001" else round(wt$p.value, 4),
+            effect_r,
+            if (effect_r >= 0.5) "Large" else if (effect_r >= 0.3) "Medium" else "Small",
+            if (wt$p.value < 0.05) "REJECT H₀" else "FAIL TO REJECT H₀")
+)
+
+kable(test_results, col.names = c("Metric", "Value"),
+      caption = "Table 5: Wilcoxon Rank-Sum Test Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+
+### Visualization
+
+```{r}
+p4 <- hyp_df %>%
+  filter(mode_clean %in% c("Air", "Truck", "Ocean")) %>%
+  ggplot(aes(x = mode_clean, y = cost_per_kg, fill = mode_clean)) +
+  geom_violin(alpha = 0.35, colour = NA, trim = TRUE) +
+  geom_boxplot(width = 0.22, outlier.alpha = 0.25, colour = "grey30") +
+  stat_summary(fun = median, geom = "point",
+               shape = 21, size = 4.5, fill = "white", colour = "#1A3A5C") +
+  scale_fill_manual(values = c(Air = "#4A90D9", Truck = "#6DB57A", Ocean = "#F5A623"),
+                    guide  = "none") +
+  scale_y_continuous(labels = dollar_format()) +
+  annotate("text", x = 1.5, y = max(hyp_df$cost_per_kg) * 0.93,
+           label = paste0("p ", if (wt$p.value < 0.001) "< 0.001" else round(wt$p.value, 3),
+                          "\nr = ", effect_r),
+           size = 4.2, colour = "#1A3A5C", fontface = "bold") +
+  labs(
+    title    = paste0("Hypothesis: Air is ", multiplier,
+                      "× More Expensive per KG than Truck (Loads > 500 kg)"),
+    subtitle = "Wilcoxon rank-sum test: H0 rejected (p < 0.001) | White dot = median",
+    x = NULL, y = "Cost per KG (USD)",
+    caption  = "Top-1% trimmed for clarity | Author: Murera Gisa \n Source: USAID SCMS Delivery History Dataset"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", colour = "#1A3A5C"))
+
+print(p4)
+ggsave("reports/figures/hypothesis_air_vs_truck.png", p4, width = 9, height = 5.5, dpi = 150)
+
+```
+
+### Interpretation
+
+- Statistical Findings:
+
+  - P-value: `r if (wt$p.value < 0.001) "< 0.001" else round(wt$p.value, 4)`: strongly significant
+
+  - Effect Size (r): `r effect_r` — r` if (effect_r >= 0.5) "large" else if (effect_r >= 0.3) "medium" else "small"`  effect
+
+  - Cost Difference: Air freight is `r multiplier` $\times$  more expensive per kg than truck transport (median: `r median(air_cpk)` vs `r median(truck_cpk)`)
+  
+### Business Interpretation
+
+We have rejected the null hypothesis at $\alpha = 0.05$ with a confidence level of $95\%$. There is strong statistical evidence that air freight costs significantly more per kilogram than truck transport for loads exceeding $500$Kgs. This finding has important implications for supply chain optimization as follow:
+
+- *Cost-Benefit Analysis:* The `r multiplier` $\times$ cost premium for air freight must be justified by time sensitivity or accessibility requirements
+
+- *Mode Selection Criteria:* Organizations should establish clear thresholds where truck transport is preferred unless delivery speed is critical
+
+- *Budget Planning:* Air freight budgets should be `r multiplier`$\times$ higher per kg than truck budgets for comparable heavy shipments
+
+**The Analytical Notes concerning the Ocean Freight:** While included for reference, ocean freight shows the lowest median cost (`r hyp_summary$median_cpk[hyp_summary$Mode == "Ocean"]`/kg), making it the most economical option for non-urgent heavy shipments with adequate lead time.
+
+**CURIOUS QUESTION:** Which is the shipping volume per year?
+
+```{r}
+yearly <- raw %>%
+  mutate(yr = year(dmy(scheduled_delivery_date))) %>%
+  filter(!is.na(yr)) %>%
+  count(yr)
+
+kable(yearly, col.names = c("Year", "Shipment Count"),
+      caption = "Table 6: Annual Shipment Volumes") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+
+The table 6 shows that the Peak Year: `r yearly$yr[which.max(yearly$n)]` with 
+`r max(yearly$n)` shipments, representing the highest operational volume in the dataset.
+
+## Conclusion
+
+- This EDA has successfully identified three critical data quality issues that must be addressed before proceeding with downstream analysis.
+
+- The hypothesis test confirms, with strong statistical evidence, that air freight carries a significant cost premium over truck transport for heavy loads. The analysis finds that it has direct implications on supply chain optimization.
+
+- The documented issues and recommended solutions provide a clear roadmap for the data cleaning phase, ensuring that subsequent modeling and reporting will be built on a solid, trustworthy foundation.
+
+## Data Story Telling 
+
+This section answers some questions eventhough it is presented in both detailed (`shiny dashbaord`) and superset dashboards
+
+```{r echo=FALSE}
+df <- read_csv("data/processed/cleaned_shipments.csv", show_col_types = FALSE)
+
+```
+
+### Question 1: Supply Chain Health
+
+>  Which countries have the highest average freight costs?
+
+```{r echo=FALSE}
+q1_data <- df %>%
+  filter(freight_category == "Numeric",
+         !freight_outlier_flag,
+         freight_cost_usd > 0) %>%
+  group_by(country) %>%
+  summarise(avg_freight = mean(freight_cost_usd, na.rm = TRUE),
+            n_shipments = n(), .groups = "drop") %>%
+  arrange(desc(avg_freight)) %>%
+  slice_head(n = 15)
+
+p_q1 <- ggplot(q1_data,
+               aes(x = reorder(country, avg_freight), y = avg_freight)) +
+  geom_col(aes(fill = avg_freight), show.legend = FALSE, width = 0.72) +
+  geom_text(aes(label = dollar(round(avg_freight))),
+            hjust = -0.07, size = 3.5, colour = "grey30") +
+  coord_flip() +
+  scale_fill_gradient(low = "#7EC8F5", high = "#1A3A5C") +
+  scale_y_continuous(labels = dollar_format(),
+                     expand = expansion(mult = c(0, 0.22))) +
+  labs(
+    title    = "Supply Chain Health: Top 15 Countries by Avg Freight Cost",
+    subtitle = "Numeric costs only | IQR outliers excluded | 2006–2015",
+    x = NULL, y = "Average Freight Cost (USD)",
+    caption  = "Author: Murera Gisa \n Source: USAID SCMS Delivery History"
+  ) +
+  theme_bw()
+
+print(p_q1)
+```
+
+### QUESTION 2: Operation Efficiency
+
+> Tuelve months trend of on-time delivey
+
+```{r echo=FALSE}
+last_12 <- df %>%
+  filter(delivery_status != "Unknown", !is.na(year_month)) %>%
+  group_by(year_month) %>%
+  summarise(total = n(),
+            on_time = sum(delivery_status == "On-Time"),
+            ontime_pct = round(100 * on_time / total, 1),
+            .groups = "drop") %>%
+  arrange(year_month) %>%
+  tail(12)
+
+p_q2 <- ggplot(last_12, aes(x = year_month, y = ontime_pct, group = 1)) +
+  geom_area(fill = "#4A90D9", alpha = 0.10) +
+  geom_line(colour = "#1A3A5C", linewidth = 1.4) +
+  geom_point(aes(colour = ontime_pct < 70), size = 4, show.legend = FALSE) +
+  scale_colour_manual(values = c("FALSE" = "#6DB57A", "TRUE" = "#E05C5C")) +
+  geom_hline(yintercept = 80, linetype = "dashed",
+             colour = "grey50", linewidth = 0.9) +
+  annotate("text", x = last_12$year_month[1], y = 82,
+           label = "80% target", hjust = 0, size = 3.5, colour = "grey60") +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 100)) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  labs(
+    title    = "Operational Efficiency: On-Time Delivery — Last 12 Months",
+    subtitle = "Red points = months below 70% | Dashed line = 80% programme target",
+    x = NULL, y = "On-Time Delivery Rate (%)",
+    caption  = "Author: Murera Gisa \n Source: USAID SCMS Delivery History"
+  ) +
+  theme_bw()
+
+print(p_q2)
+```
+
+### Data Story and Insight
+
+```{r echo=FALSE}
+air_cpk   <- median(df$cost_per_kg[df$shipment_mode_clean == "Air"],   na.rm = TRUE)
+truck_cpk <- median(df$cost_per_kg[df$shipment_mode_clean == "Truck"], na.rm = TRUE)
+mult      <- round(air_cpk / truck_cpk, 1)
+
+air_ot    <- round(100 * mean(df$delivery_status[df$shipment_mode_clean == "Air"]   == "On-Time", na.rm = TRUE), 0)
+truck_ot  <- round(100 * mean(df$delivery_status[df$shipment_mode_clean == "Truck"] == "On-Time", na.rm = TRUE), 0)
+
+cat(sprintf("  Air median $/kg   : $%.2f\n", air_cpk))
+cat(sprintf("  Truck median $/kg : $%.2f\n", truck_cpk))
+cat(sprintf("  Multiplier        : %.1fx\n", mult))
+cat(sprintf("  Air on-time       : %d%%\n",  air_ot))
+cat(sprintf("  Truck on-time     : %d%%\n\n", truck_ot))
+
+# ── Big Number Chart ───────────────────────────────────────────────────────────
+p_bn <- ggplot() +
+  annotate("rect", xmin=0, xmax=10, ymin=0, ymax=10, fill="#1A3A5C") +
+  annotate("text", x=5, y=7.1, label=paste0(mult, "×"),
+           colour="#F5A623", size=32, fontface="bold", hjust=0.5) +
+  annotate("text", x=5, y=5.0,
+           label="Air freight costs MORE per kg than Truck",
+           colour="white", size=7, fontface="bold", hjust=0.5) +
+  annotate("text", x=5, y=3.1,
+           label=paste0(
+             "Air on-time rate (", air_ot, "%)  ≈  Truck (", truck_ot, "%)\n",
+             "The cost premium buys NO better delivery performance."
+           ),
+           colour="#7EC8F5", size=4.8, hjust=0.5, lineheight=1.5) +
+  annotate("text", x=5, y=0.7,
+           label="USAID SCMS Delivery History | 2006–2015 | 10,324 shipments",
+           colour="grey60", size=3.2, hjust=0.5) +
+  xlim(0,10) + ylim(0,10) +
+  theme_void()
+
+print(p_bn)
+```
+
+### Historical Trends
+
+```{r echo=FALSE}
+# ── Time-Series Chart ──────────────────────────────────────────────────────────
+PALETTE <- c(Air="#4A90D9", Truck="#6DB57A", Ocean="#F5A623", "Air Charter"="#7EC8F5")
+
+ts_cpk <- df %>%
+  filter(!is.na(cost_per_kg), !is.na(year),
+         !is.na(shipment_mode_clean),
+         cost_per_kg < quantile(cost_per_kg, 0.99, na.rm=TRUE)) %>%
+  group_by(year, Mode=shipment_mode_clean) %>%
+  summarise(avg_cpk=mean(cost_per_kg, na.rm=TRUE), .groups="drop")
+
+ts_ot <- df %>%
+  filter(delivery_status != "Unknown", !is.na(year),
+         !is.na(shipment_mode_clean)) %>%
+  group_by(year, Mode=shipment_mode_clean) %>%
+  summarise(ontime_pct=round(100*mean(delivery_status=="On-Time"),1),
+            .groups="drop")
+
+p_ts_top <- ggplot(ts_cpk, aes(x=year, y=avg_cpk, colour=Mode, group=Mode)) +
+  geom_line(linewidth=1.6) + geom_point(size=3.2) +
+  scale_colour_manual(values=PALETTE) +
+  scale_y_continuous(labels=dollar_format()) +
+  scale_x_continuous(breaks=2006:2015) +
+  labs(
+    title    = "The Director's Story: Cost per KG by Mode — 10-Year Trend",
+    subtitle = paste0(
+      "Air consistently costs more per kg across all 10 years. ",
+      "For bulk non-urgent commodities, switching to Truck\n",
+      "reduces freight spend without sacrificing delivery reliability."
+    ),
+    x=NULL, y="Avg Cost per KG (USD)", colour="Mode"
+  ) +
+  theme_bw() + theme(legend.position="top")
+
+p_ts_bot <- ggplot(ts_ot, aes(x=year, y=ontime_pct, colour=Mode, group=Mode)) +
+  geom_line(linewidth=1.1, linetype="dashed") + geom_point(size=2.5) +
+  scale_colour_manual(values=PALETTE, guide="none") +
+  scale_y_continuous(labels=function(x) paste0(x,"%"), limits=c(0,100)) +
+  scale_x_continuous(breaks=2006:2015) +
+  labs(subtitle="On-time rate by mode — no consistent Air advantage",
+       x="Year", y="On-Time Rate (%)") +
+  theme_bw()
+
+# Stack the two panels
+p_ts_combined <- gridExtra::grid.arrange(p_ts_top, p_ts_bot,
+                                         nrow=2, heights=c(3, 1.6))
+
+
+
+```
+
+=========================================================================================
+## APPENDIX: Full functions for data validation 
+
+```{r}
+#' Comprehensive Data Quality Check for SCMS Dataset
+#' @param df Raw SCMS dataframe
+#' @return List of quality issues and recommendations
+
+check_scms_quality <- function(df) {
+  issues <- list()
+  
+  # Issue 1: Non-numeric freight
+  freight_text <- sum(!str_detect(df$`Freight Cost (USD)`, "^\\d") & 
+                       !is.na(df$`Freight Cost (USD)`))
+  issues$freight_non_numeric <- list(
+    count = freight_text,
+    pct = round(100 * freight_text / nrow(df), 1),
+    recommendation = "Classify into: numeric, 'Included', 'See row', or missing"
+  )
+  
+  # Issue 2: Outliers
+  numeric_vals <- suppressWarnings(as.numeric(df$`Freight Cost (USD)`))
+  q3 <- quantile(numeric_vals, 0.75, na.rm = TRUE)
+  q1 <- quantile(numeric_vals, 0.25, na.rm = TRUE)
+  iqr <- q3 - q1
+  outliers <- sum(numeric_vals > (q3 + 1.5 * iqr), na.rm = TRUE)
+  issues$freight_outliers <- list(
+    count = outliers,
+    pct = round(100 * outliers / sum(!is.na(numeric_vals)), 1),
+    recommendation = "Flag with IQR method; use median for robust averages"
+  )
+  
+  # Issue 3: "N/A" sentinel
+  na_strings <- sum(df$`Shipment Mode` == "N/A", na.rm = TRUE)
+  issues$mode_na_string <- list(
+    count = na_strings,
+    pct = round(100 * na_strings / nrow(df), 1),
+    recommendation = "Recode 'N/A' to NA_character_ before analysis"
+  )
+  
+  return(issues)
+}
+
+```
+
+**Conclusion:** You need only to load the dataset with the same column names as our data [Supply Chain Shipment Pricing Data](https://www.kaggle.com/datasets/apoorvwatsky/supply-chain-shipment-pricing-data/data)
+
